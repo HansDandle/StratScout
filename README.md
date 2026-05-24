@@ -10,6 +10,7 @@ The legacy CLIs in the parent directory (`etf_dashboard.py`, `walk_forward.py`, 
 
 ## Table of contents
 
+- [Walk-forward research results](#walk-forward-research-results)
 - [The end-to-end flow](#the-end-to-end-flow)
 - [Tab-by-tab guide](#tab-by-tab-guide)
   - [Onboarding](#1-onboarding-pick-a-starting-strategy)
@@ -26,6 +27,100 @@ The legacy CLIs in the parent directory (`etf_dashboard.py`, `walk_forward.py`, 
 - [Environment variables](#environment-variables)
 - [What's missing](#whats-missing-roadmap)
 - [Quick start (dev)](#quick-start-dev)
+
+---
+
+## Walk-forward research results
+
+This section documents the iterative research process behind the ETF rotation engine — what was tried, what failed, and what survived honest out-of-sample testing. All results are OOS: each month was traded using parameters trained *only* on prior data.
+
+### Strategy overview
+
+The core strategy is a regime-based ETF rotation:
+
+1. **Regime detection** — compare AGG 90-day return vs BIL to determine risk-on or risk-off
+2. **Risk-on** — rotate into the top N leveraged/growth ETFs ranked by a momentum + inverse-volatility blend
+3. **Risk-off (rising rates)** — rotate into short/inverse ETFs
+4. **Risk-off (falling rates)** — rotate into defensive ETFs (gold, treasuries, staples)
+
+Position weights are computed as a blend: `alpha × momentum_score + (1 - alpha) × inverse_vol_score`, normalized across selected symbols with an optional per-position cap. All thresholds, lookback windows, pool membership, and position counts are optimizer-tuned parameters.
+
+### Optimizer: Bayesian walk-forward (Optuna TPE)
+
+The standard fuzzer is random search. For the walk-forward engine, we use **Optuna's TPE (Tree-structured Parzen Estimator)** — a Bayesian optimizer that builds a probabilistic model of the parameter space and samples intelligently rather than randomly. Each month's optimization seeds from the **Hall of Fame** (HoF): a shared SQLite database that stores profitable parameter sets from all prior runs, with market-condition features (SPY 1-month return, 3-month return, realized vol, regime, seasonality). New months are seeded via KNN on these features — if today's market looks like March 2022, the optimizer starts near parameters that worked in historically similar regimes.
+
+### Training window experiments
+
+Five training window lengths were tested (how many months of history the optimizer trains on before each live month):
+
+| Training window | Outcome |
+|---|---|
+| 3 months | Too little signal — optimizer overfits to recent noise |
+| 6 months | Improved, still unstable |
+| **12 months** | **Optimal across all metrics — consistent winner** |
+| 18 months | Slight degradation — older signals dilute recent ones |
+| 24 months | Optimizer shifted to pure vol weighting; momentum signal stale |
+
+**12 months won cleanly.** A notable finding: across every window length tested independently, the optimizer converged on `combo_alpha ≈ 0.5` (equal blend of momentum and inverse-vol). This convergence from different starting points is evidence the 50/50 blend is a real signal, not noise.
+
+### Scoring objective: Calmar ratio vs raw return
+
+Two scoring objectives were compared from Jan 2020 on the same 76-month out-of-sample window:
+
+| Metric | Raw return scoring | Calmar scoring |
+|---|---|---|
+| Final portfolio ($10k start) | $22,686 | **$32,501** |
+| SPY buy-hold | $19,916 | $19,916 |
+| Avg monthly return | 1.44% | **1.93%** |
+| Avg Calmar ratio | 24.2 | **33.4** |
+| Win rate | 45% | **47%** |
+| Worst month | -21.5% | **-16.9%** |
+
+**Calmar scoring won on every metric.** By telling the optimizer to maximize `CAGR / |max_drawdown|` instead of raw CAGR, the system naturally produces strategies that make money without large dips — the drawdown hurts both the numerator and denominator of the ratio simultaneously.
+
+### Intramonth stop-loss
+
+A stop-loss was added: if the portfolio drops `stop_loss_pct`% from the month's entry value, liquidate to cash and lock out re-entry for `stop_loss_lockout_days` trading days (~1 calendar month).
+
+**The whipsaw problem** was the key engineering challenge. Without a lockout, the system could stop out at -13%, re-enter a few days later, stop out again, and compound losses to -65% in a single month. The ~22-day lockout enforces "if stopped out, stay cash for the rest of the month." The optimizer tunes both `stop_loss_pct` (4–20%) and `stop_loss_lockout_days` (15–30).
+
+### Volatility targeting
+
+Instead of a binary stop-loss, volatility targeting scales exposure continuously: at each rebalance, compute the 21-day realized annualized portfolio volatility and scale all position weights by `min(1.0, vol_target / realized_vol)`. When vol is elevated, the system is partially in cash. When vol is low, it's fully deployed.
+
+This was suggested as a replacement for the binary stop-loss. Result from Jan 2020 (76 months OOS):
+
+| Metric | Calmar + Stop-Loss | **Calmar + Vol Targeting** |
+|---|---|---|
+| Final portfolio ($10k start) | $32,501 | **$76,987** |
+| SPY buy-hold | $19,916 | $19,916 |
+| Avg monthly return | 1.93% | **3.27%** |
+| Avg Calmar ratio | 33.4 | **99.3** |
+| Avg MaxDD per month | -5.7% | **-5.5%** |
+| Win rate | 47% | **57%** |
+| Worst month | **-16.9%** | -19.8% |
+| Avg vol target chosen | — | **7.35%** |
+
+Vol targeting won decisively. The optimizer settled on a 7.35% annualized vol target — fairly conservative, meaning it often scales exposure to 60–70% of a full position in rough regimes. Both mechanisms (stop-loss + vol target) remained active; the optimizer kept the stop-loss at ~12% as a last-resort floor while vol targeting handled smooth regime transitions.
+
+### Slippage
+
+All results include **5 basis points (0.05%) slippage** per trade applied at execution, baked into `rebalance_positions` as a default. This is conservative for liquid ETFs (actual spread on SPY/QQQ is 1–2 bps) but appropriate for the leveraged names (SOXL, TQQQ) where spreads and impact are higher.
+
+### Key findings summary
+
+- **12-month training window** is the robust choice — not too stale, not too noisy
+- **Calmar scoring** consistently outperforms raw return scoring for risk-adjusted results
+- **Volatility targeting** dominates binary stop-loss — smoother, higher Calmar, better win rate
+- **combo_alpha ≈ 0.4–0.5** (near-equal momentum/vol blend) is robust across all configurations
+- The strategy genuinely beats SPY buy-and-hold on a risk-adjusted basis over 2020–2026
+
+### Important caveats
+
+- All results are **in-sample with respect to the universe** — the ETF pool was chosen with knowledge of which assets existed and performed well. A completely blind universe would produce lower numbers.
+- The 2020–2026 test window includes the COVID crash/recovery and the 2024 AI boom — both are particularly favorable for a leveraged-ETF momentum strategy. A 2010–2020 run (in progress) will test behavior during lower-vol, non-AI-driven markets.
+- **Transaction costs beyond slippage** — taxes, bid/ask spreads during volatility spikes, and next-open execution gaps are not modeled. For monthly rotators these are small but non-zero.
+- **Survivorship bias** in the ETF pool — leveraged ETFs that failed or were delisted are not in the universe.
 
 ---
 
