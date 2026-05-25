@@ -130,7 +130,9 @@ def _worker_init(no_factors: bool = False):
     global _histories, _factors
     from stratscout.engine.backtest.etf import load_local_histories
     from stratscout.engine.data.universes import ALL_SYMBOLS
-    _histories = load_local_histories(ALL_SYMBOLS, "2018-01-01", date.today().isoformat())
+    # SPY needed for low-vol regime detection (realized vol threshold)
+    syms = list(dict.fromkeys(ALL_SYMBOLS + ["SPY", "QQQ", "MTUM", "VGT", "XLK", "QQQM"]))
+    _histories = load_local_histories(syms, "2005-01-01", date.today().isoformat())
     if no_factors:
         _factors = {}
     else:
@@ -298,6 +300,8 @@ def _build_optuna_params(trial, exclude: list[str]) -> dict:
         "stop_loss_lockout_days":  trial.suggest_int("stop_loss_lockout_days", 15, 30),
         "vol_target_pct":          trial.suggest_float("vol_target_pct", 0.0, 15.0),
         "vol_target_lookback":     trial.suggest_int("vol_target_lookback", 10, 30),
+        # Low-vol regime: 0 = disabled, >0 = SPY annualized vol threshold to switch pools
+        "low_vol_threshold":       trial.suggest_float("low_vol_threshold", 0.0, 20.0),
     }
 
 
@@ -317,6 +321,7 @@ _OPTUNA_SCALAR_KEYS = {
     "opex_caution_days", "layoffs_caution_zscore",
     "combo_momentum_lookback", "combo_vol_lookback", "combo_alpha", "combo_max_weight",
     "stop_loss_pct", "stop_loss_lockout_days", "vol_target_pct", "vol_target_lookback",
+    "low_vol_threshold",
 }
 
 

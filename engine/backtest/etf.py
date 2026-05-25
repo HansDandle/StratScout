@@ -122,6 +122,10 @@ DEFAULT_PARAMS: dict[str, Any] = {
     "vol_target_pct":          0.0,
     # Lookback window (trading days) for realized vol computation
     "vol_target_lookback":     21,
+    # Low-vol regime: when SPY 21-day realized vol is below this % annualized,
+    # use low_vol_pool (unleveraged) instead of risk_on_pool. 0 = disabled.
+    "low_vol_threshold":       0.0,
+    "low_vol_pool":            ["QQQ", "MTUM", "VGT", "XLK"],
 }
 
 
@@ -193,6 +197,9 @@ def random_params(exclude: list[str] | None = None) -> dict[str, Any]:
         # Vol targeting disabled by default in random search; Optuna tunes it
         "vol_target_pct":          0.0,
         "vol_target_lookback":     21,
+        # Low-vol regime switch disabled by default; Optuna tunes the threshold
+        "low_vol_threshold":       0.0,
+        "low_vol_pool":            ["QQQ", "MTUM", "VGT", "XLK"],
     }
 
 
@@ -553,7 +560,25 @@ def choose_targets(histories: dict[str, pd.DataFrame], as_of, params: dict,
         return picks
 
     if _cumret(agg, abl, as_of) > _cumret(bil, abl, as_of):
-        pool = params["risk_on_pool"]
+        # Low-vol regime: if realized SPY vol is below threshold, use unleveraged
+        # momentum pool so the strategy stays deployed in calm grinding bull markets
+        # instead of getting vol-targeted to cash on leveraged ETFs.
+        low_vol_threshold = params.get("low_vol_threshold", 0.0)
+        if low_vol_threshold > 0 and "SPY" in histories:
+            spy_close = histories["SPY"]["close"].loc[:as_of]
+            if len(spy_close) >= 22:
+                daily_rets = spy_close.iloc[-22:].pct_change().dropna()
+                import math as _math
+                realized_vol = daily_rets.std() * _math.sqrt(252) * 100
+                if realized_vol < low_vol_threshold:
+                    low_vol_pool = params.get("low_vol_pool", ["QQQ", "MTUM", "VGT", "XLK"])
+                    pool = [s for s in low_vol_pool if s in histories] or params["risk_on_pool"]
+                else:
+                    pool = params["risk_on_pool"]
+            else:
+                pool = params["risk_on_pool"]
+        else:
+            pool = params["risk_on_pool"]
         n = min(params["n_risk_on"], len(pool))
         window = params["risk_on_rsi_window"]
         rsi_vals = {sym: _rsi_at(sym, window) for sym in pool if sym in histories}
